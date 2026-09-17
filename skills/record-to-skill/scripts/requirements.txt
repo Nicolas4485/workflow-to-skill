@@ -1,0 +1,4 @@
+# Local speech-to-text. The first run downloads the Whisper model (a few hundred MB).
+# A version range instead of an exact pin: the right build of ctranslate2 depends on
+# the Python version installed at the user's end.
+faster-whisper>=1.1.0

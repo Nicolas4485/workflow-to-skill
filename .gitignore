@@ -1,0 +1,14 @@
+# Python
+__pycache__/
+*.pyc
+.venv/
+
+# Extraction outputs (frames, transcripts, manifests live next to the video, not in the repo)
+*_extract/
+workflow-notes.md
+
+# Build artifact (users install via the marketplace URL)
+workflow-to-skill.plugin
+
+# Temporary audio
+*.wav
