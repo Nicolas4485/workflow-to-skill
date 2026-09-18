@@ -2,3 +2,9 @@
 # A version range instead of an exact pin: the right build of ctranslate2 depends on
 # the Python version installed at the user's end.
 faster-whisper>=1.1.0
+
+# Live capture (capture.py)
+mss>=9
+Pillow>=10
+pynput>=1.7
+sounddevice>=0.4

@@ -44,6 +44,16 @@ Record the screen with the microphone ON and narrate every click: what you are c
 
 Saying "turn this recording into a skill" with a path also triggers it.
 
+## Live capture (no video file)
+
+Instead of recording a video first, capture while you work. Run this in a terminal:
+
+```
+python <plugin-folder>/skills/record-to-skill/scripts/capture.py
+```
+
+Every mouse click saves a screenshot of the monitor you clicked on, and the mic records continuously. Press Esc to finish. It prints a folder; tell Claude "turn this recording into a skill" with that folder. Needs the capture dependencies: `python -m pip install -r skills/record-to-skill/scripts/requirements.txt`
+
 ## Privacy
 
 Everything runs locally: frame extraction, audio extraction, and transcription. Nothing is uploaded anywhere. The one exception: passing `--cloud` to extract.py sends the audio track (only the audio) to OpenAI for transcription, and the script prints a warning when it does.
@@ -57,4 +67,4 @@ Everything runs locally: frame extraction, audio extraction, and transcription. 
 
 ## Roadmap
 
-- Live capture while you work (screenshot on every click plus mic recording), not built yet.
+- Live capture shipped in v0.2.0. Nothing else planned yet.

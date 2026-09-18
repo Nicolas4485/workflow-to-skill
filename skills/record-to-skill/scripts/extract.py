@@ -85,7 +85,7 @@ def run(cmd: list[str], why: str) -> subprocess.CompletedProcess[str]:
 
 def parse_timestamp(value: str, flag: str) -> float:
     parts = value.split(":")
-    if len(parts) not in (2, 3) or not all(p.isdigit() for p in parts):
+    if len(parts) not in (2, 3) or not all(re.fullmatch(r"[0-9]+", p) for p in parts):
         die(f"{flag} must look like MM:SS (or HH:MM:SS), got '{value}'.")
     parts_int = [int(p) for p in parts]
     if len(parts_int) == 2:
@@ -103,6 +103,10 @@ def parse_timestamp(value: str, flag: str) -> float:
 def mmss(t: float, sep: str = ":") -> str:
     total = int(t)
     return f"{total // 60:02d}{sep}{total % 60:02d}"
+
+
+def frame_filename(index: int, seconds: float) -> str:
+    return f"frame_{index:04d}_{mmss(seconds, '-')}.jpg"
 
 
 def probe_duration(video: Path) -> float:
@@ -187,14 +191,56 @@ def thin_evenly(times: list[float], max_frames: int) -> list[float]:
     return [times[i] for i in indices]
 
 
+OWNERSHIP_MARKER = ".workflow-to-skill"
+
+
+def mark_ownership(out_dir: Path) -> None:
+    """Stamp the folder as ours so later runs may clean it safely."""
+    marker = out_dir / OWNERSHIP_MARKER
+    if marker.is_symlink():
+        raise RuntimeError(f"{marker} is a symlink. Refusing to write through it.")
+    marker.write_text(
+        "Extraction folder created by the workflow-to-skill plugin. Safe to delete.\n",
+        encoding="utf-8",
+    )
+
+
+def clear_previous_outputs(out_dir: Path) -> None:
+    """Delete the outputs of an earlier run, refusing files we did not write.
+
+    The single place any old output is deleted. Ownership proof: our marker
+    file, or our MANIFEST.md header (folders made before the marker existed).
+    """
+    existing = [n for n in ("MANIFEST.md", "transcript.txt", "transcript.json") if (out_dir / n).is_file()]
+    stale_frames = [p for p in out_dir.glob("frame_*.jpg") if FRAME_NAME_PATTERN.fullmatch(p.name)]
+    if not existing and not stale_frames:
+        return
+    owned = (out_dir / OWNERSHIP_MARKER).is_file()
+    if not owned:
+        manifest = out_dir / "MANIFEST.md"
+        if manifest.is_file():
+            try:
+                owned = manifest.read_text(encoding="utf-8", errors="replace").startswith("# Extract manifest")
+            except OSError:
+                owned = False
+    if not owned:
+        found = ", ".join(existing + [p.name for p in stale_frames[:3]])
+        raise RuntimeError(
+            f"The output folder already contains files this tool did not write ({found}). "
+            f"Choose a different --out folder. Folder: {out_dir}"
+        )
+    for name in existing:
+        (out_dir / name).unlink()
+    for frame in stale_frames:
+        frame.unlink()
+
+
 def extract_frames(video: Path, times: list[float], out_dir: Path) -> list[tuple[str, float]]:
-    # Remove stale frames from a previous run of this script, and nothing else.
-    for stale in out_dir.glob("frame_*.jpg"):
-        if FRAME_NAME_PATTERN.fullmatch(stale.name):
-            stale.unlink()
+    # Stale frames were already removed by clear_previous_outputs, which is
+    # the only place old output may be deleted (it verifies ownership).
     frames: list[tuple[str, float]] = []
     for index, t in enumerate(times, start=1):
-        name = f"frame_{index:04d}_{mmss(t, '-')}.jpg"
+        name = frame_filename(index, t)
         target = out_dir / name
         run(
             [
@@ -332,16 +378,17 @@ def write_transcript(out_dir: Path, segments: list[Segment], source: str) -> int
 
 def write_manifest(
     out_dir: Path,
-    video: Path,
+    source_name: str,
     duration: float,
     frames: list[tuple[str, float]],
     segments: list[Segment],
     word_count: int,
+    frame_notes: dict[str, str] | None = None,
 ) -> None:
     lines = [
         "# Extract manifest",
         "",
-        f"Video: {video.name}",
+        f"Source: {source_name}",
         f"Duration: {mmss(duration)}",
         f"Frames: {len(frames)}",
         f"Transcript words: {word_count}",
@@ -352,6 +399,8 @@ def write_manifest(
     ]
     for name, t in frames:
         lines.append(f"## {name} ({mmss(t)})")
+        if frame_notes and name in frame_notes:
+            lines.append(f"- {frame_notes[name]}")
         nearby = [
             seg for seg in segments
             if seg.start <= t + NEARBY_SECONDS and seg.end >= t - NEARBY_SECONDS
@@ -409,8 +458,8 @@ def main() -> None:
     # MANIFEST.md is written last, so its presence marks a complete extract.
     # Remove stale outputs first: a failed rerun must never leave an old
     # manifest pointing at deleted or replaced frames.
-    for stale_name in ("MANIFEST.md", "transcript.txt", "transcript.json"):
-        (out_dir / stale_name).unlink(missing_ok=True)
+    clear_previous_outputs(out_dir)
+    mark_ownership(out_dir)
 
     print(f"Detecting scene changes (threshold {args.scene})...")
     times = detect_scene_times(video, args.scene, start, end)
@@ -419,7 +468,9 @@ def main() -> None:
             f"Scene detection found {len(times)} frames (fewer than {MIN_SCENE_FRAMES}). "
             f"Falling back to one frame every {args.fallback_interval:g} seconds."
         )
-        times = interval_times(start, end, args.fallback_interval)
+        # Keep the few detected scene changes; they can carry brief moments
+        # the fixed interval would miss.
+        times = sorted(set(times + interval_times(start, end, args.fallback_interval)))
     times = thin_evenly(times, args.max_frames)
 
     print(f"Extracting {len(times)} frames...")
@@ -447,7 +498,7 @@ def main() -> None:
         print("No audio stream found. The transcript will be empty.")
 
     word_count = write_transcript(out_dir, segments, source)
-    write_manifest(out_dir, video, duration, frames, segments, word_count)
+    write_manifest(out_dir, video.name, duration, frames, segments, word_count)
 
     print("")
     print("Done.")

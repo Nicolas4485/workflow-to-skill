@@ -27,6 +27,12 @@ Report the script's printed summary to the user: duration, frame count, transcri
 
 If the script cannot run in this environment (no ffmpeg, no Python, no faster-whisper), do not improvise a workaround. Give the user the exact command above to run in their own terminal, name what the error says is missing, and tell them to rerun this skill with the extract folder as the path.
 
+Live capture variant: if the user wants to capture while they work instead of recording a video, give them this command to run in their own terminal. Tell them to narrate out loud and press Esc to finish, then treat the folder it prints as the extract folder and continue at step 3.
+
+```
+python "${CLAUDE_PLUGIN_ROOT}/skills/record-to-skill/scripts/capture.py"
+```
+
 ## 3. Read the evidence
 
 Read in this order:

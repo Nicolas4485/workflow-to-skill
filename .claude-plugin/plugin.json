@@ -1,7 +1,7 @@
 {
   "name": "workflow-to-skill",
   "description": "Turn a narrated screen recording of a workflow into a tested Claude skill. Extracts keyframes and a timestamped transcript locally, drafts workflow notes, takes one round of corrections, then uses skill-creator to write and test the skill.",
-  "version": "0.1.1",
+  "version": "0.2.0",
   "author": {
     "name": "Nicolas Sakr",
     "url": "https://targt.ai"
