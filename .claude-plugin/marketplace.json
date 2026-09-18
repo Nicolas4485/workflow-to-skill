@@ -10,7 +10,7 @@
       "name": "workflow-to-skill",
       "source": "./",
       "description": "Turn a narrated screen recording of a workflow into a tested Claude skill.",
-      "version": "0.1.0",
+      "version": "0.1.1",
       "author": {
         "name": "Nicolas Sakr"
       }

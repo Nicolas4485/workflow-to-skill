@@ -17,6 +17,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import math
 import os
 import re
 import shutil
@@ -27,13 +28,17 @@ import urllib.request
 import uuid
 from dataclasses import dataclass
 from pathlib import Path
+from typing import NoReturn
 
 VIDEO_EXTENSIONS = {".mp4", ".mov", ".mkv", ".webm"}
 MIN_SCENE_FRAMES = 8
 FRAME_WIDTH = 1024
 JPEG_QSCALE = "5"  # ffmpeg mjpeg qscale 5 is roughly JPEG quality 80
 NEARBY_SECONDS = 4.0
+MAX_INTERVAL_FRAMES = 10000
 OPENAI_TRANSCRIPTION_URL = "https://api.openai.com/v1/audio/transcriptions"
+# Matches only frames this script writes, e.g. frame_0007_02-15.jpg
+FRAME_NAME_PATTERN = re.compile(r"frame_\d{4,}_\d{2,}-\d{2}\.jpg")
 
 
 @dataclass
@@ -43,7 +48,7 @@ class Segment:
     text: str
 
 
-def die(message: str) -> None:
+def die(message: str) -> NoReturn:
     print(f"ERROR: {message}", file=sys.stderr)
     sys.exit(1)
 
@@ -67,7 +72,9 @@ def check_tools() -> None:
 
 def run(cmd: list[str], why: str) -> subprocess.CompletedProcess[str]:
     try:
-        result = subprocess.run(cmd, capture_output=True, text=True, errors="replace")
+        result = subprocess.run(cmd, capture_output=True, text=True, errors="replace", timeout=1800)
+    except subprocess.TimeoutExpired:
+        raise RuntimeError(f"{cmd[0]} took more than 30 minutes while {why} and was stopped.")
     except OSError as exc:
         raise RuntimeError(f"Could not start {cmd[0]} while {why}: {exc}") from exc
     if result.returncode != 0:
@@ -88,6 +95,8 @@ def parse_timestamp(value: str, flag: str) -> float:
         hours, minutes, seconds = parts_int
     if seconds > 59:
         die(f"{flag}: seconds must be 00-59, got '{value}'.")
+    if len(parts_int) == 3 and minutes > 59:
+        die(f"{flag}: minutes must be 00-59 in HH:MM:SS, got '{value}'.")
     return hours * 3600 + minutes * 60 + seconds
 
 
@@ -107,9 +116,12 @@ def probe_duration(video: Path) -> float:
         "reading the video duration",
     )
     try:
-        return float(result.stdout.strip())
+        duration = float(result.stdout.strip())
     except ValueError:
         raise RuntimeError(f"ffprobe returned no duration for {video.name}. Is it a valid video?")
+    if not math.isfinite(duration) or duration <= 0:
+        raise RuntimeError(f"{video.name} reports an invalid duration. Is it a valid video?")
+    return duration
 
 
 def has_audio_stream(video: Path) -> bool:
@@ -137,17 +149,31 @@ def detect_scene_times(video: Path, threshold: float, start: float, end: float) 
         ],
         "detecting scene changes",
     )
-    times = [float(m) for m in re.findall(r"pts_time:([0-9]+\.?[0-9]*)", result.stderr)]
+    # ffmpeg may print near-zero timestamps in scientific notation (1e-05).
+    times: list[float] = []
+    for raw in re.findall(r"pts_time:([0-9.eE+-]+)", result.stderr):
+        try:
+            t = float(raw)
+        except ValueError:
+            continue
+        if math.isfinite(t) and t >= 0:
+            times.append(t)
+    # Always include the opening frame: the initial screen state matters and
+    # scene detection almost never fires at the very first frame.
+    times.append(round(start, 3))
     return sorted(set(times))
 
 
 def interval_times(start: float, end: float, interval: float) -> list[float]:
-    times: list[float] = []
-    t = start
-    while t < end:
-        times.append(round(t, 3))
-        t += interval
-    return times or [start]
+    ratio = (end - start) / interval
+    if not math.isfinite(ratio) or ratio > MAX_INTERVAL_FRAMES:
+        raise RuntimeError(
+            f"--fallback-interval {interval:g} would produce too many frames for this video "
+            f"(limit {MAX_INTERVAL_FRAMES}). Use a larger interval."
+        )
+    count = math.ceil(ratio)
+    # Index-based generation avoids floating-point drift from repeated addition.
+    return [round(start + i * interval, 3) for i in range(count)] or [start]
 
 
 def thin_evenly(times: list[float], max_frames: int) -> list[float]:
@@ -155,13 +181,17 @@ def thin_evenly(times: list[float], max_frames: int) -> list[float]:
     n = len(times)
     if n <= max_frames:
         return times
+    if max_frames == 1:
+        return [times[0]]
     indices = sorted({round(i * (n - 1) / (max_frames - 1)) for i in range(max_frames)})
     return [times[i] for i in indices]
 
 
 def extract_frames(video: Path, times: list[float], out_dir: Path) -> list[tuple[str, float]]:
+    # Remove stale frames from a previous run of this script, and nothing else.
     for stale in out_dir.glob("frame_*.jpg"):
-        stale.unlink()
+        if FRAME_NAME_PATTERN.fullmatch(stale.name):
+            stale.unlink()
     frames: list[tuple[str, float]] = []
     for index, t in enumerate(times, start=1):
         name = f"frame_{index:04d}_{mmss(t, '-')}.jpg"
@@ -217,13 +247,18 @@ def transcribe_local(wav: Path, model_name: str, offset: float) -> list[Segment]
             f"Could not download the Whisper model '{model_name}'. "
             f"Check the model name and the internet connection.\n{exc}"
         ) from exc
-    model = WhisperModel(str(model_path), device="cpu", compute_type="int8")
-    segments, _info = model.transcribe(str(wav), vad_filter=True)
-    return [
-        Segment(seg.start + offset, seg.end + offset, seg.text.strip())
-        for seg in segments
-        if seg.text.strip()
-    ]
+    try:
+        model = WhisperModel(str(model_path), device="cpu", compute_type="int8")
+        segments, _info = model.transcribe(str(wav), vad_filter=True)
+        return [
+            Segment(seg.start + offset, seg.end + offset, seg.text.strip())
+            for seg in segments
+            if seg.text.strip()
+        ]
+    except RuntimeError:
+        raise
+    except Exception as exc:
+        raise RuntimeError(f"Local transcription failed: {exc}") from exc
 
 
 def transcribe_cloud(wav: Path, offset: float) -> list[Segment]:
@@ -260,11 +295,26 @@ def transcribe_cloud(wav: Path, offset: float) -> list[Segment]:
         raise RuntimeError(f"OpenAI transcription failed (HTTP {exc.code}). {detail}") from exc
     except urllib.error.URLError as exc:
         raise RuntimeError(f"Could not reach OpenAI: {exc.reason}") from exc
-    return [
-        Segment(float(seg["start"]) + offset, float(seg["end"]) + offset, str(seg["text"]).strip())
-        for seg in payload.get("segments", [])
-        if str(seg.get("text", "")).strip()
-    ]
+    if not isinstance(payload, dict) or not isinstance(payload.get("segments"), list):
+        raise RuntimeError("OpenAI returned a transcript in an unexpected format (no segments list).")
+    segments: list[Segment] = []
+    try:
+        for seg in payload["segments"]:
+            text = str(seg.get("text", "")).strip()
+            if not text:
+                continue
+            if not isinstance(seg.get("text"), str):
+                raise ValueError("segment text is not a string")
+            seg_start = float(seg["start"])
+            seg_end = float(seg["end"])
+            if not (math.isfinite(seg_start) and math.isfinite(seg_end)):
+                raise ValueError(f"non-finite timestamps {seg_start!r}, {seg_end!r}")
+            if seg_start < 0 or seg_end < seg_start:
+                raise ValueError(f"invalid timestamp order {seg_start}..{seg_end}")
+            segments.append(Segment(seg_start + offset, seg_end + offset, text))
+    except (AttributeError, KeyError, TypeError, ValueError) as exc:
+        raise RuntimeError(f"OpenAI returned a transcript in an unexpected format: {exc}") from exc
+    return segments
 
 
 def write_transcript(out_dir: Path, segments: list[Segment], source: str) -> int:
@@ -341,8 +391,10 @@ def main() -> None:
         die(f"'{video.suffix}' is not a supported video type. Use one of: {allowed}")
     if args.max_frames < 1:
         die("--max-frames must be at least 1.")
-    if args.fallback_interval <= 0:
-        die("--fallback-interval must be greater than 0.")
+    if not math.isfinite(args.fallback_interval) or args.fallback_interval <= 0:
+        die("--fallback-interval must be a number greater than 0.")
+    if not math.isfinite(args.scene) or not 0 <= args.scene <= 1:
+        die("--scene must be a number between 0 and 1.")
 
     check_tools()
     duration = probe_duration(video)
@@ -353,6 +405,12 @@ def main() -> None:
 
     out_dir = Path(args.out).expanduser().resolve() if args.out else video.parent / f"{video.stem}_extract"
     out_dir.mkdir(parents=True, exist_ok=True)
+
+    # MANIFEST.md is written last, so its presence marks a complete extract.
+    # Remove stale outputs first: a failed rerun must never leave an old
+    # manifest pointing at deleted or replaced frames.
+    for stale_name in ("MANIFEST.md", "transcript.txt", "transcript.json"):
+        (out_dir / stale_name).unlink(missing_ok=True)
 
     print(f"Detecting scene changes (threshold {args.scene})...")
     times = detect_scene_times(video, args.scene, start, end)
@@ -370,15 +428,21 @@ def main() -> None:
     segments: list[Segment] = []
     source = "none (no audio stream)"
     if has_audio_stream(video):
-        wav = out_dir / "audio_tmp.wav"
-        extract_audio(video, wav, start, end)
-        if args.cloud:
-            segments = transcribe_cloud(wav, offset=start)
-            source = "openai whisper-1 (cloud)"
-        else:
-            segments = transcribe_local(wav, args.whisper_model, offset=start)
-            source = f"faster-whisper {args.whisper_model} (local)"
-        wav.unlink(missing_ok=True)
+        # Unique name: never clobber a user's file, never collide with a
+        # concurrent run on the same folder.
+        wav = out_dir / f"audio_tmp_{uuid.uuid4().hex}.wav"
+        try:
+            extract_audio(video, wav, start, end)
+            if args.cloud:
+                segments = transcribe_cloud(wav, offset=start)
+                source = "openai whisper-1 (cloud)"
+            else:
+                segments = transcribe_local(wav, args.whisper_model, offset=start)
+                source = f"faster-whisper {args.whisper_model} (local)"
+        finally:
+            # The wav is raw microphone audio; never leave it behind,
+            # not even when transcription fails.
+            wav.unlink(missing_ok=True)
     else:
         print("No audio stream found. The transcript will be empty.")
 
@@ -400,3 +464,7 @@ if __name__ == "__main__":
         die("Cancelled.")
     except RuntimeError as exc:
         die(str(exc))
+    except OSError as exc:
+        die(f"File error: {exc}")
+    except json.JSONDecodeError as exc:
+        die(f"Received a response that is not valid JSON: {exc}")
